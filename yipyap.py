@@ -201,3 +201,62 @@ async def get_drama(days: int = 7) -> str:
         result += f"**URL:** {post['url']}\n\n"
     
     return result
+
+
+@mcp.tool()
+async def get_trending(days: int = 7) -> str:
+    """Get trending AI posts with high engagement (comment-to-score ratio).
+    
+    Args:
+        days: Number of days to look back (default: 7)
+    """
+    
+    errors = []
+    
+    try:
+        reddit_posts = await fetch_reddit_posts(days=days, limit=100)
+        for post in reddit_posts:
+            post["ratio"] = post["comments"] / max(post["score"], 1)
+        reddit_posts.sort(key=lambda x: x["ratio"], reverse=True)
+        reddit_trending = reddit_posts[:5]
+    except Exception as e:
+        reddit_trending = []
+        errors.append(f"Reddit error: {str(e)}")
+    
+    try:
+        hn_posts = await fetch_hn_posts(days=days, limit=100)
+        for post in hn_posts:
+            post["ratio"] = post["comments"] / max(post["score"], 1)
+        hn_posts.sort(key=lambda x: x["ratio"], reverse=True)
+        hn_trending = hn_posts[:5]
+    except Exception as e:
+        hn_trending = []
+        errors.append(f"HN error: {str(e)}")
+    
+    all_posts = reddit_trending + hn_trending
+    all_posts.sort(key=lambda x: x["ratio"], reverse=True)
+    
+    if not all_posts:
+        error_msg = f"No trending posts found in the past {days} day(s)."
+        if errors:
+            error_msg += "\n\nErrors encountered:\n" + "\n".join(errors)
+        return error_msg
+    
+    result = f"# Trending AI Discussions - Past {days} Day(s)\n\n"
+    result += "*Posts with high engagement (lots of discussion relative to upvotes)*\n\n"
+    
+    for i, post in enumerate(all_posts[:10], 1):
+        created_date = datetime.fromtimestamp(post["created"]).strftime("%Y-%m-%d")
+        source = post["source"]
+        if source == "Reddit":
+            source_detail = f"{source} (r/{post['subreddit']})"
+        else:
+            source_detail = source
+        
+        result += f"## {i}. {post['title']}\n"
+        result += f"**Source:** {source_detail}\n"
+        result += f"**Score:** {post['score']} points | {post['comments']} comments (ratio: {post['ratio']:.2f})\n"
+        result += f"**Date:** {created_date}\n"
+        result += f"**URL:** {post['url']}\n\n"
+    
+    return result
