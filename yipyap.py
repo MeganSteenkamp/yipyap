@@ -90,6 +90,43 @@ async def fetch_hn_posts(days: int = 7, limit: int = 5) -> list[dict[str, Any]]:
         return posts
 
 
+async def fetch_reddit_controversial(days: int = 7, limit: int = 5) -> list[dict[str, Any]]:
+    days_ago = datetime.now() - timedelta(days=days)
+    days_ago_timestamp = days_ago.timestamp()
+    
+    all_posts = []
+    
+    time_param = "day" if days <= 1 else "week" if days <= 7 else "month"
+    
+    async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+        for subreddit in SUBREDDITS:
+            response = await client.get(
+                f"https://www.reddit.com/r/{subreddit}/controversial.json",
+                params={"limit": 100, "t": time_param},
+                headers={"User-Agent": "yipyap/1.0"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            for child in data.get("data", {}).get("children", []):
+                post = child.get("data", {})
+                created_utc = post.get("created_utc", 0)
+                
+                if created_utc >= days_ago_timestamp:
+                    all_posts.append({
+                        "title": post.get("title", ""),
+                        "url": post.get("url", ""),
+                        "score": post.get("score", 0),
+                        "comments": post.get("num_comments", 0),
+                        "created": created_utc,
+                        "source": "Reddit",
+                        "subreddit": subreddit,
+                    })
+    
+    all_posts.sort(key=lambda x: x["comments"], reverse=True)
+    return all_posts[:limit]
+
+
 @mcp.tool()
 async def summarise_weekly() -> str:
     """Get top tech news from the past week across Reddit and Hacker News."""
@@ -129,6 +166,36 @@ async def summarise_weekly() -> str:
         
         result += f"## {i}. {post['title']}\n"
         result += f"**Source:** {source_detail}\n"
+        result += f"**Score:** {post['score']} points | {post['comments']} comments\n"
+        result += f"**Date:** {created_date}\n"
+        result += f"**URL:** {post['url']}\n\n"
+    
+    return result
+
+
+@mcp.tool()
+async def get_drama(days: int = 7) -> str:
+    """Get controversial/heated AI discussions from Reddit.
+    
+    Args:
+        days: Number of days to look back (default: 7)
+    """
+    
+    try:
+        drama_posts = await fetch_reddit_controversial(days=days, limit=5)
+    except Exception as e:
+        return f"Error fetching controversial posts: {str(e)}"
+    
+    if not drama_posts:
+        return f"No controversial posts found in the past {days} day(s)."
+    
+    result = f"# Controversial AI Discussions - Past {days} Day(s)\n\n"
+    
+    for i, post in enumerate(drama_posts, 1):
+        created_date = datetime.fromtimestamp(post["created"]).strftime("%Y-%m-%d")
+        
+        result += f"## {i}. {post['title']}\n"
+        result += f"**Source:** Reddit (r/{post['subreddit']})\n"
         result += f"**Score:** {post['score']} points | {post['comments']} comments\n"
         result += f"**Date:** {created_date}\n"
         result += f"**URL:** {post['url']}\n\n"
