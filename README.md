@@ -1,20 +1,32 @@
 # YipYap - AI Tech News MCP Server
 
-An MCP (Model Context Protocol) server that fetches AI tech news from Reddit and Hacker News.
+An MCP (Model Context Protocol) server that fetches AI tech news from Reddit and Hacker News, with AI-powered article summarization.
 
 ## Features
 
 Four tools to help you stay up-to-date with AI news:
 
-- **`summarise_weekly`** - Get top AI news from the past week
-- **`get_news`** - Search for news about specific AI topics
-- **`get_trending`** - Find posts with high engagement (lots of discussion)
-- **`get_drama`** - Discover controversial AI discussions
+- **`summarise_weekly`** - Get top AI news from the past week with AI-generated TLDRs
+- **`get_news`** - Search for news about specific AI topics with TLDRs
+- **`get_trending`** - Find posts with high engagement (lots of discussion) with TLDRs
+- **`get_drama`** - Discover controversial AI discussions with TLDRs
+
+Each tool now includes AI-powered article summarization using Groq's Llama model, providing concise TLDRs for linked articles. Photo-only posts are automatically filtered out to focus on substantive content.
 
 ## Installation
 
 ```bash
 pip install -e .
+```
+
+## Setup
+
+1. Get a free Groq API key from [https://console.groq.com](https://console.groq.com)
+
+2. Create a `.env` file in the project root:
+
+```bash
+GROQ_API_KEY=your_groq_api_key_here
 ```
 
 ## Usage
@@ -52,7 +64,7 @@ Then restart Claude Desktop.
 
 ### summarise_weekly()
 
-Get the top 10 AI news posts from the past week across Reddit and Hacker News, sorted by score.
+Get the top 10 AI news posts from the past week across Reddit and Hacker News, sorted by score. Each post includes an AI-generated TLDR of the linked article.
 
 **Example:**
 ```
@@ -61,7 +73,7 @@ summarise_weekly()
 
 ### get_news(keyword, days=7)
 
-Search for news about a specific AI topic.
+Search for news about a specific AI topic with AI-generated TLDRs.
 
 **Parameters:**
 - `keyword` (required) - Search term (e.g., "GPT-5", "Claude", "Gemini")
@@ -74,7 +86,7 @@ get_news(keyword="Claude", days=3)
 
 ### get_trending(days=7)
 
-Find posts with high engagement - lots of comments relative to upvotes.
+Find posts with high engagement - lots of comments relative to upvotes. Includes AI-generated TLDRs.
 
 **Parameters:**
 - `days` (optional) - Number of days to look back (default: 7)
@@ -86,7 +98,7 @@ get_trending(days=7)
 
 ### get_drama(days=7)
 
-Discover controversial AI discussions on Reddit.
+Discover controversial AI discussions on Reddit with AI-generated TLDRs.
 
 **Parameters:**
 - `days` (optional) - Number of days to look back (default: 7)
@@ -117,6 +129,14 @@ get_drama(days=3)
 
 **Hacker News:**
 - All AI-related stories via Algolia API
+
+## How It Works
+
+1. Fetches posts from Reddit and Hacker News
+2. Filters out photo-only posts
+3. Fetches article content from URLs
+4. Generates concise TLDRs using Groq's Llama 3.3 70B model
+5. Returns formatted results with metadata and summaries
 
 ## License
 

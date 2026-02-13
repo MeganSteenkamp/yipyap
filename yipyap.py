@@ -1,10 +1,67 @@
+import os
+import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from groq import AsyncGroq
 from mcp.server.fastmcp import FastMCP
 
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+
 mcp = FastMCP("yipyap")
+
+groq_api_key = os.environ.get("GROQ_API_KEY")
+if groq_api_key:
+    logging.info(f"✓ GROQ_API_KEY loaded (starts with: {groq_api_key[:10]}...)")
+else:
+    logging.error("✗ GROQ_API_KEY not found in environment variables")
+
+groq_base_url = os.environ.get("GROQ_BASE_URL") or None
+groq_timeout_seconds = float(os.environ.get("GROQ_TIMEOUT_SECONDS", "30"))
+groq_max_retries = int(os.environ.get("GROQ_MAX_RETRIES", "4"))
+groq_ssl_verify_raw = os.environ.get("GROQ_SSL_VERIFY", "true")
+groq_ssl_verify = groq_ssl_verify_raw.strip().lower() not in {"0", "false", "no", "off"}
+groq_ca_bundle = os.environ.get("GROQ_CA_BUNDLE") or None
+
+logging.info(f"Groq base URL: {groq_base_url or 'https://api.groq.com'}")
+logging.info(f"Groq timeout: {groq_timeout_seconds}s | max retries: {groq_max_retries}")
+if groq_ca_bundle:
+    logging.info(f"Groq TLS: using custom CA bundle at {groq_ca_bundle}")
+else:
+    logging.info(f"Groq TLS: verify={groq_ssl_verify}")
+
+groq_http_client = (
+    httpx.AsyncClient(
+        timeout=groq_timeout_seconds,
+        verify=groq_ca_bundle if groq_ca_bundle else groq_ssl_verify,
+    )
+    if groq_api_key
+    else None
+)
+
+groq_client = (
+    AsyncGroq(
+        api_key=groq_api_key,
+        base_url=groq_base_url,
+        max_retries=groq_max_retries,
+        http_client=groq_http_client,
+    )
+    if groq_api_key
+    else None
+)
+
+SUMMARIZATION_PROMPT = """Summarize the following article in 2-3 concise sentences. Focus on the key points and main takeaways.
+
+Article:
+{content}
+
+TLDR:"""
 
 SUBREDDITS = [
     "MachineLearning",
@@ -20,9 +77,85 @@ SUBREDDITS = [
     "LangChain",
     "StableDiffusion",
     "ArtificialInteligence",
-    "Futurology",
-    "ControlProblem"
+    "ControlProblem",
+    "technology",
 ]
+
+
+def is_photo_only_post(post: dict[str, Any]) -> bool:
+    post_hint = post.get("post_hint", "")
+    is_self = post.get("is_self", False)
+    url = post.get("url", "")
+    selftext = post.get("selftext", "")
+    
+    if post_hint == "image":
+        return True
+    
+    if is_self and not selftext:
+        return True
+    
+    image_domains = ["i.redd.it", "imgur.com", "i.imgur.com"]
+    if any(domain in url for domain in image_domains) and not selftext:
+        return True
+    
+    return False
+
+
+async def fetch_article_content(url: str) -> str:
+    logging.info(f"📥 Attempting to fetch: {url}")
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, verify=False) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            
+            article = soup.find("article")
+            if article:
+                text = article.get_text(separator=" ", strip=True)
+            else:
+                main = soup.find("main") or soup.find("body")
+                text = main.get_text(separator=" ", strip=True) if main else ""
+            
+            words = text.split()[:1000]
+            content = " ".join(words)
+            logging.info(f"✓ Fetched content from {url[:50]}... ({len(content)} chars)")
+            return content
+    except Exception as e:
+        logging.error(f"✗ Failed to fetch {url[:50]}...: {type(e).__name__}: {str(e)}")
+        return ""
+
+
+async def generate_tldr(content: str) -> str:
+    if not content or len(content) < 100:
+        logging.warning(f"✗ Content too short for TLDR ({len(content)} chars)")
+        return ""
+    if groq_client is None:
+        logging.error("✗ GROQ_API_KEY not configured; cannot generate TLDR")
+        return ""
+    
+    try:
+        logging.info(f"→ Generating TLDR for {len(content)} chars of content...")
+        response = await groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": SUMMARIZATION_PROMPT.format(content=content[:8000])
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            max_tokens=150,
+        )
+        tldr = response.choices[0].message.content.strip()
+        logging.info(f"✓ Generated TLDR: {tldr[:50]}...")
+        return tldr
+    except Exception as e:
+        logging.exception(f"✗ Failed to generate TLDR: {type(e).__name__}: {str(e)}")
+        return ""
 
 
 async def fetch_reddit_posts(days: int = 7, limit: int = 5) -> list[dict[str, Any]]:
@@ -45,7 +178,7 @@ async def fetch_reddit_posts(days: int = 7, limit: int = 5) -> list[dict[str, An
                 post = child.get("data", {})
                 created_utc = post.get("created_utc", 0)
                 
-                if created_utc >= seven_days_ago_timestamp:
+                if created_utc >= seven_days_ago_timestamp and not is_photo_only_post(post):
                     all_posts.append({
                         "title": post.get("title", ""),
                         "url": post.get("url", ""),
@@ -116,7 +249,7 @@ async def search_reddit_posts(keyword: str, days: int = 7, limit: int = 5) -> li
                 post = child.get("data", {})
                 created_utc = post.get("created_utc", 0)
                 
-                if created_utc >= days_ago_timestamp:
+                if created_utc >= days_ago_timestamp and not is_photo_only_post(post):
                     all_posts.append({
                         "title": post.get("title", ""),
                         "url": post.get("url", ""),
@@ -184,7 +317,7 @@ async def fetch_reddit_controversial(days: int = 7, limit: int = 5) -> list[dict
                 post = child.get("data", {})
                 created_utc = post.get("created_utc", 0)
                 
-                if created_utc >= days_ago_timestamp:
+                if created_utc >= days_ago_timestamp and not is_photo_only_post(post):
                     all_posts.append({
                         "title": post.get("title", ""),
                         "url": post.get("url", ""),
@@ -201,7 +334,7 @@ async def fetch_reddit_controversial(days: int = 7, limit: int = 5) -> list[dict
 
 @mcp.tool()
 async def summarise_weekly() -> str:
-    """Get top tech news from the past week across Reddit and Hacker News."""
+    """Get top tech news from the past week across Reddit and Hacker News with AI-generated TLDRs."""
     
     errors = []
     
@@ -228,6 +361,8 @@ async def summarise_weekly() -> str:
     
     result = "# Top Tech News - Past Week\n\n"
     
+    logging.info(f"\n📊 Processing {len(all_posts[:10])} posts for TLDRs...\n")
+    
     for i, post in enumerate(all_posts[:10], 1):
         created_date = datetime.fromtimestamp(post["created"]).strftime("%Y-%m-%d")
         source = post["source"]
@@ -240,14 +375,23 @@ async def summarise_weekly() -> str:
         result += f"**Source:** {source_detail}\n"
         result += f"**Score:** {post['score']} points | {post['comments']} comments\n"
         result += f"**Date:** {created_date}\n"
-        result += f"**URL:** {post['url']}\n\n"
+        result += f"**URL:** {post['url']}\n"
+        
+        logging.info(f"\n[{i}/10] Processing: {post['title'][:60]}...")
+        content = await fetch_article_content(post['url'])
+        if content:
+            tldr = await generate_tldr(content)
+            if tldr:
+                result += f"\n**TLDR:** {tldr}\n"
+        
+        result += "\n"
     
     return result
 
 
 @mcp.tool()
 async def get_drama(days: int = 7) -> str:
-    """Get controversial/heated AI discussions from Reddit.
+    """Get controversial/heated AI discussions from Reddit with AI-generated TLDRs.
     
     Args:
         days: Number of days to look back (default: 7)
@@ -270,14 +414,22 @@ async def get_drama(days: int = 7) -> str:
         result += f"**Source:** Reddit (r/{post['subreddit']})\n"
         result += f"**Score:** {post['score']} points | {post['comments']} comments\n"
         result += f"**Date:** {created_date}\n"
-        result += f"**URL:** {post['url']}\n\n"
+        result += f"**URL:** {post['url']}\n"
+        
+        content = await fetch_article_content(post['url'])
+        if content:
+            tldr = await generate_tldr(content)
+            if tldr:
+                result += f"\n**TLDR:** {tldr}\n"
+        
+        result += "\n"
     
     return result
 
 
 @mcp.tool()
 async def get_trending(days: int = 7) -> str:
-    """Get trending AI posts with high engagement (comment-to-score ratio).
+    """Get trending AI posts with high engagement (comment-to-score ratio) and AI-generated TLDRs.
     
     Args:
         days: Number of days to look back (default: 7)
@@ -329,14 +481,22 @@ async def get_trending(days: int = 7) -> str:
         result += f"**Source:** {source_detail}\n"
         result += f"**Score:** {post['score']} points | {post['comments']} comments (ratio: {post['ratio']:.2f})\n"
         result += f"**Date:** {created_date}\n"
-        result += f"**URL:** {post['url']}\n\n"
+        result += f"**URL:** {post['url']}\n"
+        
+        content = await fetch_article_content(post['url'])
+        if content:
+            tldr = await generate_tldr(content)
+            if tldr:
+                result += f"\n**TLDR:** {tldr}\n"
+        
+        result += "\n"
     
     return result
 
 
 @mcp.tool()
 async def get_news(keyword: str, days: int = 7) -> str:
-    """Search for news about a specific AI topic or keyword.
+    """Search for news about a specific AI topic or keyword with AI-generated TLDRs.
     
     Args:
         keyword: The topic or keyword to search for (e.g., "GPT-5", "Claude", "Gemini")
@@ -380,6 +540,36 @@ async def get_news(keyword: str, days: int = 7) -> str:
         result += f"**Source:** {source_detail}\n"
         result += f"**Score:** {post['score']} points | {post['comments']} comments\n"
         result += f"**Date:** {created_date}\n"
-        result += f"**URL:** {post['url']}\n\n"
+        result += f"**URL:** {post['url']}\n"
+        
+        content = await fetch_article_content(post['url'])
+        if content:
+            tldr = await generate_tldr(content)
+            if tldr:
+                result += f"\n**TLDR:** {tldr}\n"
+        
+        result += "\n"
     
     return result
+
+
+@mcp.tool()
+async def groq_healthcheck() -> str:
+    """Check Groq connectivity and auth."""
+    if groq_client is None:
+        return "GROQ_API_KEY not configured."
+
+    try:
+        await groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": "Reply with exactly: ok"}],
+            model="llama-3.3-70b-versatile",
+            temperature=0,
+            max_tokens=5,
+        )
+        return "Groq request succeeded."
+    except Exception as e:
+        logging.exception(f"✗ Groq healthcheck failed: {type(e).__name__}: {str(e)}")
+        return f"Groq request failed: {type(e).__name__}: {str(e)}"
+
+if __name__ == "__main__":
+    mcp.run()
