@@ -2,7 +2,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Awaitable, Literal, NotRequired, TypedDict
 
 import httpx
 from bs4 import BeautifulSoup
@@ -12,49 +12,92 @@ from mcp.server.fastmcp import FastMCP
 
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
 
-logging.basicConfig(level=logging.INFO, format='%(message)s')
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 mcp = FastMCP("yipyap")
 
+USER_AGENT = "yipyap/0.1.0"
+FALSEY = {"0", "false", "no", "off"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in FALSEY
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+HTTP_VERIFY = _env_bool("YIPYAP_HTTP_VERIFY", False)
+HTTP_TIMEOUT_SECONDS = _env_float("YIPYAP_HTTP_TIMEOUT_SECONDS", 30.0)
+ARTICLE_FETCH_TIMEOUT_SECONDS = _env_float("YIPYAP_ARTICLE_FETCH_TIMEOUT_SECONDS", 15.0)
+HTTP_CA_BUNDLE = (
+    os.environ.get("YIPYAP_HTTP_CA_BUNDLE")
+    or os.environ.get("REQUESTS_CA_BUNDLE")
+    or os.environ.get("SSL_CERT_FILE")
+    or None
+)
+
+HTTP_VERIFY_VALUE: str | bool = HTTP_CA_BUNDLE if HTTP_CA_BUNDLE else HTTP_VERIFY
+
+
+class Post(TypedDict):
+    title: str
+    url: str
+    score: int
+    comments: int
+    created: int
+    source: Literal["Reddit", "HackerNews"]
+    subreddit: NotRequired[str]
+    ratio: NotRequired[float]
+
+
 groq_api_key = os.environ.get("GROQ_API_KEY")
 if groq_api_key:
-    logging.info(f"✓ GROQ_API_KEY loaded (starts with: {groq_api_key[:10]}...)")
+    logging.info("✓ GROQ_API_KEY loaded")
 else:
     logging.error("✗ GROQ_API_KEY not found in environment variables")
 
 groq_base_url = os.environ.get("GROQ_BASE_URL") or None
-groq_timeout_seconds = float(os.environ.get("GROQ_TIMEOUT_SECONDS", "30"))
-groq_max_retries = int(os.environ.get("GROQ_MAX_RETRIES", "4"))
-groq_ssl_verify_raw = os.environ.get("GROQ_SSL_VERIFY", "true")
-groq_ssl_verify = groq_ssl_verify_raw.strip().lower() not in {"0", "false", "no", "off"}
+groq_timeout_seconds = _env_float("GROQ_TIMEOUT_SECONDS", 30.0)
+groq_max_retries = _env_int("GROQ_MAX_RETRIES", 4)
+groq_ssl_verify = _env_bool("GROQ_SSL_VERIFY", False)
 groq_ca_bundle = os.environ.get("GROQ_CA_BUNDLE") or None
 
-logging.info(f"Groq base URL: {groq_base_url or 'https://api.groq.com'}")
-logging.info(f"Groq timeout: {groq_timeout_seconds}s | max retries: {groq_max_retries}")
-if groq_ca_bundle:
-    logging.info(f"Groq TLS: using custom CA bundle at {groq_ca_bundle}")
-else:
-    logging.info(f"Groq TLS: verify={groq_ssl_verify}")
-
-groq_http_client = (
-    httpx.AsyncClient(
+groq_http_client = None
+if groq_api_key:
+    groq_http_client = httpx.AsyncClient(
         timeout=groq_timeout_seconds,
         verify=groq_ca_bundle if groq_ca_bundle else groq_ssl_verify,
     )
-    if groq_api_key
-    else None
-)
 
-groq_client = (
-    AsyncGroq(
+groq_client: AsyncGroq | None = None
+if groq_api_key:
+    groq_client = AsyncGroq(
         api_key=groq_api_key,
         base_url=groq_base_url,
         max_retries=groq_max_retries,
         http_client=groq_http_client,
     )
-    if groq_api_key
-    else None
-)
 
 SUMMARIZATION_PROMPT = """Summarize the following article in 2-3 concise sentences. Focus on the key points and main takeaways.
 
@@ -63,7 +106,7 @@ Article:
 
 TLDR:"""
 
-SUBREDDITS = [
+SUBREDDITS: list[str] = [
     "MachineLearning",
     "artificial",
     "LocalLLaMA",
@@ -77,49 +120,93 @@ SUBREDDITS = [
     "LangChain",
     "StableDiffusion",
     "ArtificialInteligence",
+    "Futurology",
     "ControlProblem",
     "technology",
 ]
 
+def _as_str(value: object) -> str:
+    return value if isinstance(value, str) else ""
 
-def is_photo_only_post(post: dict[str, Any]) -> bool:
-    post_hint = post.get("post_hint", "")
-    is_self = post.get("is_self", False)
-    url = post.get("url", "")
-    selftext = post.get("selftext", "")
-    
+
+def _as_int(value: object) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_photo_only_post(post: dict[str, object]) -> bool:
+    post_hint = _as_str(post.get("post_hint", ""))
     if post_hint == "image":
         return True
-    
+
+    is_self = bool(post.get("is_self", False))
+    selftext = _as_str(post.get("selftext", ""))
     if is_self and not selftext:
         return True
-    
-    image_domains = ["i.redd.it", "imgur.com", "i.imgur.com"]
-    if any(domain in url for domain in image_domains) and not selftext:
-        return True
-    
-    return False
+
+    url = _as_str(post.get("url", ""))
+    if not url or selftext:
+        return False
+
+    image_domains = ("i.redd.it", "imgur.com", "i.imgur.com")
+    return any(domain in url for domain in image_domains)
+
+
+def _reddit_post_to_post(post: dict[str, object], subreddit: str) -> Post:
+    return {
+        "title": _as_str(post.get("title", "")),
+        "url": _as_str(post.get("url", "")),
+        "score": _as_int(post.get("score", 0)),
+        "comments": _as_int(post.get("num_comments", 0)),
+        "created": _as_int(post.get("created_utc", 0)),
+        "source": "Reddit",
+        "subreddit": subreddit,
+    }
+
+
+def _hn_hit_to_post(hit: dict[str, object]) -> Post:
+    object_id = _as_str(hit.get("objectID", ""))
+    url = _as_str(hit.get("url", ""))
+    if not url:
+        url = f"https://news.ycombinator.com/item?id={object_id}"
+
+    return {
+        "title": _as_str(hit.get("title", "")),
+        "url": url,
+        "score": _as_int(hit.get("points", 0)),
+        "comments": _as_int(hit.get("num_comments", 0)),
+        "created": _as_int(hit.get("created_at_i", 0)),
+        "source": "HackerNews",
+    }
 
 
 async def fetch_article_content(url: str) -> str:
-    logging.info(f"📥 Attempting to fetch: {url}")
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, verify=False) as client:
+        async with httpx.AsyncClient(
+            timeout=ARTICLE_FETCH_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            verify=HTTP_VERIFY_VALUE,
+            headers={"User-Agent": USER_AGENT},
+        ) as client:
             response = await client.get(url)
             response.raise_for_status()
-            
+
             soup = BeautifulSoup(response.text, "html.parser")
-            
+
             for tag in soup(["script", "style", "nav", "footer", "header"]):
                 tag.decompose()
-            
+
             article = soup.find("article")
             if article:
                 text = article.get_text(separator=" ", strip=True)
             else:
                 main = soup.find("main") or soup.find("body")
                 text = main.get_text(separator=" ", strip=True) if main else ""
-            
+
             words = text.split()[:1000]
             content = " ".join(words)
             logging.info(f"✓ Fetched content from {url[:50]}... ({len(content)} chars)")
@@ -133,12 +220,7 @@ async def generate_tldr(content: str) -> str:
     if not content or len(content) < 100:
         logging.warning(f"✗ Content too short for TLDR ({len(content)} chars)")
         return ""
-    if groq_client is None:
-        logging.error("✗ GROQ_API_KEY not configured; cannot generate TLDR")
-        return ""
-    
     try:
-        logging.info(f"→ Generating TLDR for {len(content)} chars of content...")
         response = await groq_client.chat.completions.create(
             messages=[
                 {
@@ -158,46 +240,60 @@ async def generate_tldr(content: str) -> str:
         return ""
 
 
-async def fetch_reddit_posts(days: int = 7, limit: int = 5) -> list[dict[str, Any]]:
-    seven_days_ago = datetime.now() - timedelta(days=days)
-    seven_days_ago_timestamp = seven_days_ago.timestamp()
-    
-    all_posts = []
-    
-    async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+async def _fetch_reddit(
+    path: str,
+    *,
+    days: int,
+    params: dict[str, str | int],
+) -> list[Post]:
+    threshold = datetime.now() - timedelta(days=days)
+    threshold_ts = threshold.timestamp()
+
+    posts: list[Post] = []
+    async with httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT_SECONDS,
+        verify=HTTP_VERIFY_VALUE,
+        headers={"User-Agent": USER_AGENT},
+    ) as client:
         for subreddit in SUBREDDITS:
             response = await client.get(
-                f"https://www.reddit.com/r/{subreddit}/top.json",
-                params={"limit": 100, "t": "week"},
-                headers={"User-Agent": "yipyap/1.0"},
+                f"https://www.reddit.com/r/{subreddit}/{path}",
+                params=params,
             )
             response.raise_for_status()
             data = response.json()
-            
-            for child in data.get("data", {}).get("children", []):
-                post = child.get("data", {})
+
+            children = data.get("data", {}).get("children", [])
+            for child in children:
+                raw = child.get("data", {})
+                if not isinstance(raw, dict):
+                    continue
+                post = raw
                 created_utc = post.get("created_utc", 0)
-                
-                if created_utc >= seven_days_ago_timestamp and not is_photo_only_post(post):
-                    all_posts.append({
-                        "title": post.get("title", ""),
-                        "url": post.get("url", ""),
-                        "score": post.get("score", 0),
-                        "comments": post.get("num_comments", 0),
-                        "created": created_utc,
-                        "source": "Reddit",
-                        "subreddit": subreddit,
-                    })
-    
-    all_posts.sort(key=lambda x: x["score"], reverse=True)
-    return all_posts[:limit]
+                if float(created_utc or 0) < threshold_ts:
+                    continue
+                if is_photo_only_post(post):
+                    continue
+                posts.append(_reddit_post_to_post(post, subreddit=subreddit))
+
+    return posts
 
 
-async def fetch_hn_posts(days: int = 7, limit: int = 5) -> list[dict[str, Any]]:
+async def fetch_reddit_posts(days: int = 7, limit: int = 5) -> list[Post]:
+    posts = await _fetch_reddit("top.json", days=days, params={"limit": 100, "t": "week"})
+    posts.sort(key=lambda x: x["score"], reverse=True)
+    return posts[:limit]
+
+
+async def fetch_hn_posts(days: int = 7, limit: int = 5) -> list[Post]:
     seven_days_ago = datetime.now() - timedelta(days=days)
     seven_days_ago_timestamp = int(seven_days_ago.timestamp())
-    
-    async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+
+    async with httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT_SECONDS,
+        verify=HTTP_VERIFY_VALUE,
+        headers={"User-Agent": USER_AGENT},
+    ) as client:
         response = await client.get(
             "https://hn.algolia.com/api/v1/search",
             params={
@@ -208,67 +304,41 @@ async def fetch_hn_posts(days: int = 7, limit: int = 5) -> list[dict[str, Any]]:
         )
         response.raise_for_status()
         data = response.json()
-        
-        posts = []
+
+        posts: list[Post] = []
         for hit in data.get("hits", []):
-            posts.append({
-                "title": hit.get("title", ""),
-                "url": hit.get("url", "") or f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}",
-                "score": hit.get("points", 0),
-                "comments": hit.get("num_comments", 0),
-                "created": hit.get("created_at_i", 0),
-                "source": "HackerNews",
-            })
-        
+            if not isinstance(hit, dict):
+                continue
+            posts.append(_hn_hit_to_post(hit))
+
         return posts
 
 
-async def search_reddit_posts(keyword: str, days: int = 7, limit: int = 5) -> list[dict[str, Any]]:
-    days_ago = datetime.now() - timedelta(days=days)
-    days_ago_timestamp = days_ago.timestamp()
-    
-    all_posts = []
-    
-    async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
-        for subreddit in SUBREDDITS:
-            response = await client.get(
-                f"https://www.reddit.com/r/{subreddit}/search.json",
-                params={
-                    "q": keyword,
-                    "restrict_sr": 1,
-                    "sort": "top",
-                    "t": "all",
-                    "limit": 25,
-                },
-                headers={"User-Agent": "yipyap/1.0"},
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            for child in data.get("data", {}).get("children", []):
-                post = child.get("data", {})
-                created_utc = post.get("created_utc", 0)
-                
-                if created_utc >= days_ago_timestamp and not is_photo_only_post(post):
-                    all_posts.append({
-                        "title": post.get("title", ""),
-                        "url": post.get("url", ""),
-                        "score": post.get("score", 0),
-                        "comments": post.get("num_comments", 0),
-                        "created": created_utc,
-                        "source": "Reddit",
-                        "subreddit": subreddit,
-                    })
-    
-    all_posts.sort(key=lambda x: x["score"], reverse=True)
-    return all_posts[:limit]
+async def search_reddit_posts(keyword: str, days: int = 7, limit: int = 5) -> list[Post]:
+    posts = await _fetch_reddit(
+        "search.json",
+        days=days,
+        params={
+            "q": keyword,
+            "restrict_sr": 1,
+            "sort": "top",
+            "t": "all",
+            "limit": 25,
+        },
+    )
+    posts.sort(key=lambda x: x["score"], reverse=True)
+    return posts[:limit]
 
 
-async def search_hn_posts(keyword: str, days: int = 7, limit: int = 5) -> list[dict[str, Any]]:
+async def search_hn_posts(keyword: str, days: int = 7, limit: int = 5) -> list[Post]:
     days_ago = datetime.now() - timedelta(days=days)
     days_ago_timestamp = int(days_ago.timestamp())
-    
-    async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+
+    async with httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT_SECONDS,
+        verify=HTTP_VERIFY_VALUE,
+        headers={"User-Agent": USER_AGENT},
+    ) as client:
         response = await client.get(
             "https://hn.algolia.com/api/v1/search",
             params={
@@ -280,296 +350,204 @@ async def search_hn_posts(keyword: str, days: int = 7, limit: int = 5) -> list[d
         )
         response.raise_for_status()
         data = response.json()
-        
-        posts = []
+
+        posts: list[Post] = []
         for hit in data.get("hits", []):
-            posts.append({
-                "title": hit.get("title", ""),
-                "url": hit.get("url", "") or f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}",
-                "score": hit.get("points", 0),
-                "comments": hit.get("num_comments", 0),
-                "created": hit.get("created_at_i", 0),
-                "source": "HackerNews",
-            })
-        
+            if not isinstance(hit, dict):
+                continue
+            posts.append(_hn_hit_to_post(hit))
+
         return posts
 
 
-async def fetch_reddit_controversial(days: int = 7, limit: int = 5) -> list[dict[str, Any]]:
-    days_ago = datetime.now() - timedelta(days=days)
-    days_ago_timestamp = days_ago.timestamp()
-    
-    all_posts = []
-    
-    time_param = "day" if days <= 1 else "week" if days <= 7 else "month"
-    
-    async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
-        for subreddit in SUBREDDITS:
-            response = await client.get(
-                f"https://www.reddit.com/r/{subreddit}/controversial.json",
-                params={"limit": 100, "t": time_param},
-                headers={"User-Agent": "yipyap/1.0"},
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            for child in data.get("data", {}).get("children", []):
-                post = child.get("data", {})
-                created_utc = post.get("created_utc", 0)
-                
-                if created_utc >= days_ago_timestamp and not is_photo_only_post(post):
-                    all_posts.append({
-                        "title": post.get("title", ""),
-                        "url": post.get("url", ""),
-                        "score": post.get("score", 0),
-                        "comments": post.get("num_comments", 0),
-                        "created": created_utc,
-                        "source": "Reddit",
-                        "subreddit": subreddit,
-                    })
-    
-    all_posts.sort(key=lambda x: x["comments"], reverse=True)
-    return all_posts[:limit]
+async def fetch_reddit_controversial(days: int = 7, limit: int = 5) -> list[Post]:
+    if days <= 1:
+        time_param = "day"
+    elif days <= 7:
+        time_param = "week"
+    else:
+        time_param = "month"
+
+    posts = await _fetch_reddit(
+        "controversial.json",
+        days=days,
+        params={"limit": 100, "t": time_param},
+    )
+    posts.sort(key=lambda x: x["comments"], reverse=True)
+    return posts[:limit]
+
+
+async def _safe_posts(label: str, call: Awaitable[list[Post]]) -> tuple[list[Post], str | None]:
+    try:
+        return await call, None
+    except Exception as e:
+        return [], f"{label} error: {str(e)}"
+
+
+def _source_detail(post: Post) -> str:
+    if post["source"] == "Reddit":
+        subreddit = post.get("subreddit", "")
+        return f"Reddit (r/{subreddit})" if subreddit else "Reddit"
+    return "HackerNews"
+
+
+def _score_line(post: Post, *, include_ratio: bool) -> str:
+    line = f"**Score:** {post['score']} points | {post['comments']} comments"
+    if include_ratio and "ratio" in post:
+        line += f" (ratio: {post['ratio']:.2f})"
+    return line
+
+
+def _render_post_block(i: int, post: Post, *, include_ratio: bool) -> str:
+    created_date = datetime.fromtimestamp(post["created"]).strftime("%Y-%m-%d")
+    lines = [
+        f"## {i}. {post['title']}\n",
+        f"**Source:** {_source_detail(post)}\n",
+        f"{_score_line(post, include_ratio=include_ratio)}\n",
+        f"**Date:** {created_date}\n",
+        f"**URL:** {post['url']}\n",
+    ]
+    return "".join(lines)
 
 
 @mcp.tool()
 async def summarise_weekly() -> str:
     """Get top tech news from the past week across Reddit and Hacker News with AI-generated TLDRs."""
-    
-    errors = []
-    
-    try:
-        reddit_posts = await fetch_reddit_posts(days=7, limit=5)
-    except Exception as e:
-        reddit_posts = []
-        errors.append(f"Reddit error: {str(e)}")
-    
-    try:
-        hn_posts = await fetch_hn_posts(days=7, limit=5)
-    except Exception as e:
-        hn_posts = []
-        errors.append(f"HN error: {str(e)}")
-    
-    all_posts = reddit_posts + hn_posts
+
+    errors: list[str] = []
+    reddit_posts, reddit_err = await _safe_posts("Reddit", fetch_reddit_posts(days=7, limit=5))
+    hn_posts, hn_err = await _safe_posts("HN", fetch_hn_posts(days=7, limit=5))
+    for err in (reddit_err, hn_err):
+        if err:
+            errors.append(err)
+
+    all_posts: list[Post] = reddit_posts + hn_posts
     all_posts.sort(key=lambda x: x["score"], reverse=True)
-    
+
     if not all_posts:
         error_msg = "No posts found in the past week."
         if errors:
             error_msg += "\n\nErrors encountered:\n" + "\n".join(errors)
         return error_msg
-    
-    result = "# Top Tech News - Past Week\n\n"
-    
-    logging.info(f"\n📊 Processing {len(all_posts[:10])} posts for TLDRs...\n")
-    
+
+    parts: list[str] = ["# Top Tech News - Past Week\n\n"]
+
     for i, post in enumerate(all_posts[:10], 1):
-        created_date = datetime.fromtimestamp(post["created"]).strftime("%Y-%m-%d")
-        source = post["source"]
-        if source == "Reddit":
-            source_detail = f"{source} (r/{post['subreddit']})"
-        else:
-            source_detail = source
-        
-        result += f"## {i}. {post['title']}\n"
-        result += f"**Source:** {source_detail}\n"
-        result += f"**Score:** {post['score']} points | {post['comments']} comments\n"
-        result += f"**Date:** {created_date}\n"
-        result += f"**URL:** {post['url']}\n"
-        
-        logging.info(f"\n[{i}/10] Processing: {post['title'][:60]}...")
-        content = await fetch_article_content(post['url'])
+        parts.append(_render_post_block(i, post, include_ratio=False))
+        content = await fetch_article_content(post["url"])
         if content:
             tldr = await generate_tldr(content)
             if tldr:
-                result += f"\n**TLDR:** {tldr}\n"
-        
-        result += "\n"
-    
-    return result
+                parts.append(f"\n**TLDR:** {tldr}\n")
+        parts.append("\n")
+
+    return "".join(parts)
 
 
 @mcp.tool()
 async def get_drama(days: int = 7) -> str:
-    """Get controversial/heated AI discussions from Reddit with AI-generated TLDRs.
-    
-    Args:
-        days: Number of days to look back (default: 7)
-    """
-    
+    """Get controversial/heated AI discussions from Reddit with AI-generated TLDRs."""
     try:
         drama_posts = await fetch_reddit_controversial(days=days, limit=5)
     except Exception as e:
         return f"Error fetching controversial posts: {str(e)}"
-    
+
     if not drama_posts:
         return f"No controversial posts found in the past {days} day(s)."
-    
-    result = f"# Controversial AI Discussions - Past {days} Day(s)\n\n"
-    
+
+    parts: list[str] = [f"# Controversial AI Discussions - Past {days} Day(s)\n\n"]
     for i, post in enumerate(drama_posts, 1):
-        created_date = datetime.fromtimestamp(post["created"]).strftime("%Y-%m-%d")
-        
-        result += f"## {i}. {post['title']}\n"
-        result += f"**Source:** Reddit (r/{post['subreddit']})\n"
-        result += f"**Score:** {post['score']} points | {post['comments']} comments\n"
-        result += f"**Date:** {created_date}\n"
-        result += f"**URL:** {post['url']}\n"
-        
-        content = await fetch_article_content(post['url'])
+        parts.append(_render_post_block(i, post, include_ratio=False))
+        content = await fetch_article_content(post["url"])
         if content:
             tldr = await generate_tldr(content)
             if tldr:
-                result += f"\n**TLDR:** {tldr}\n"
-        
-        result += "\n"
-    
-    return result
+                parts.append(f"\n**TLDR:** {tldr}\n")
+        parts.append("\n")
+
+    return "".join(parts)
 
 
 @mcp.tool()
 async def get_trending(days: int = 7) -> str:
-    """Get trending AI posts with high engagement (comment-to-score ratio) and AI-generated TLDRs.
-    
-    Args:
-        days: Number of days to look back (default: 7)
-    """
-    
-    errors = []
-    
-    try:
-        reddit_posts = await fetch_reddit_posts(days=days, limit=100)
-        for post in reddit_posts:
-            post["ratio"] = post["comments"] / max(post["score"], 1)
-        reddit_posts.sort(key=lambda x: x["ratio"], reverse=True)
-        reddit_trending = reddit_posts[:5]
-    except Exception as e:
-        reddit_trending = []
-        errors.append(f"Reddit error: {str(e)}")
-    
-    try:
-        hn_posts = await fetch_hn_posts(days=days, limit=100)
-        for post in hn_posts:
-            post["ratio"] = post["comments"] / max(post["score"], 1)
-        hn_posts.sort(key=lambda x: x["ratio"], reverse=True)
-        hn_trending = hn_posts[:5]
-    except Exception as e:
-        hn_trending = []
-        errors.append(f"HN error: {str(e)}")
-    
-    all_posts = reddit_trending + hn_trending
-    all_posts.sort(key=lambda x: x["ratio"], reverse=True)
-    
+    """Get trending AI posts with high engagement and AI-generated TLDRs."""
+    errors: list[str] = []
+
+    reddit_posts, reddit_err = await _safe_posts("Reddit", fetch_reddit_posts(days=days, limit=100))
+    if reddit_err:
+        errors.append(reddit_err)
+    for post in reddit_posts:
+        post["ratio"] = post["comments"] / max(post["score"], 1)
+    reddit_posts.sort(key=lambda x: x.get("ratio", 0.0), reverse=True)
+    reddit_trending = reddit_posts[:5]
+
+    hn_posts, hn_err = await _safe_posts("HN", fetch_hn_posts(days=days, limit=100))
+    if hn_err:
+        errors.append(hn_err)
+    for post in hn_posts:
+        post["ratio"] = post["comments"] / max(post["score"], 1)
+    hn_posts.sort(key=lambda x: x.get("ratio", 0.0), reverse=True)
+    hn_trending = hn_posts[:5]
+
+    all_posts: list[Post] = reddit_trending + hn_trending
+    all_posts.sort(key=lambda x: x.get("ratio", 0.0), reverse=True)
+
     if not all_posts:
         error_msg = f"No trending posts found in the past {days} day(s)."
         if errors:
             error_msg += "\n\nErrors encountered:\n" + "\n".join(errors)
         return error_msg
-    
-    result = f"# Trending AI Discussions - Past {days} Day(s)\n\n"
-    result += "*Posts with high engagement (lots of discussion relative to upvotes)*\n\n"
-    
+
+    parts: list[str] = [
+        f"# Trending AI Discussions - Past {days} Day(s)\n\n",
+        "*Posts with high engagement (lots of discussion relative to upvotes)*\n\n",
+    ]
+
     for i, post in enumerate(all_posts[:10], 1):
-        created_date = datetime.fromtimestamp(post["created"]).strftime("%Y-%m-%d")
-        source = post["source"]
-        if source == "Reddit":
-            source_detail = f"{source} (r/{post['subreddit']})"
-        else:
-            source_detail = source
-        
-        result += f"## {i}. {post['title']}\n"
-        result += f"**Source:** {source_detail}\n"
-        result += f"**Score:** {post['score']} points | {post['comments']} comments (ratio: {post['ratio']:.2f})\n"
-        result += f"**Date:** {created_date}\n"
-        result += f"**URL:** {post['url']}\n"
-        
-        content = await fetch_article_content(post['url'])
+        parts.append(_render_post_block(i, post, include_ratio=True))
+        content = await fetch_article_content(post["url"])
         if content:
             tldr = await generate_tldr(content)
             if tldr:
-                result += f"\n**TLDR:** {tldr}\n"
-        
-        result += "\n"
-    
-    return result
+                parts.append(f"\n**TLDR:** {tldr}\n")
+        parts.append("\n")
+
+    return "".join(parts)
 
 
 @mcp.tool()
 async def get_news(keyword: str, days: int = 7) -> str:
-    """Search for news about a specific AI topic or keyword with AI-generated TLDRs.
-    
-    Args:
-        keyword: The topic or keyword to search for (e.g., "GPT-5", "Claude", "Gemini")
-        days: Number of days to look back (default: 7)
-    """
-    
-    errors = []
-    
-    try:
-        reddit_posts = await search_reddit_posts(keyword=keyword, days=days, limit=5)
-    except Exception as e:
-        reddit_posts = []
-        errors.append(f"Reddit error: {str(e)}")
-    
-    try:
-        hn_posts = await search_hn_posts(keyword=keyword, days=days, limit=5)
-    except Exception as e:
-        hn_posts = []
-        errors.append(f"HN error: {str(e)}")
-    
-    all_posts = reddit_posts + hn_posts
+    """Search for news about a keyword with AI-generated TLDRs."""
+    errors: list[str] = []
+
+    reddit_posts, reddit_err = await _safe_posts(
+        "Reddit", search_reddit_posts(keyword=keyword, days=days, limit=5)
+    )
+    hn_posts, hn_err = await _safe_posts("HN", search_hn_posts(keyword=keyword, days=days, limit=5))
+    for err in (reddit_err, hn_err):
+        if err:
+            errors.append(err)
+
+    all_posts: list[Post] = reddit_posts + hn_posts
     all_posts.sort(key=lambda x: x["score"], reverse=True)
-    
+
     if not all_posts:
         error_msg = f"No posts found for '{keyword}' in the past {days} day(s)."
         if errors:
             error_msg += "\n\nErrors encountered:\n" + "\n".join(errors)
         return error_msg
-    
-    result = f"# News about '{keyword}' - Past {days} Day(s)\n\n"
-    
+
+    parts: list[str] = [f"# News about '{keyword}' - Past {days} Day(s)\n\n"]
     for i, post in enumerate(all_posts[:10], 1):
-        created_date = datetime.fromtimestamp(post["created"]).strftime("%Y-%m-%d")
-        source = post["source"]
-        if source == "Reddit":
-            source_detail = f"{source} (r/{post['subreddit']})"
-        else:
-            source_detail = source
-        
-        result += f"## {i}. {post['title']}\n"
-        result += f"**Source:** {source_detail}\n"
-        result += f"**Score:** {post['score']} points | {post['comments']} comments\n"
-        result += f"**Date:** {created_date}\n"
-        result += f"**URL:** {post['url']}\n"
-        
-        content = await fetch_article_content(post['url'])
+        parts.append(_render_post_block(i, post, include_ratio=False))
+        content = await fetch_article_content(post["url"])
         if content:
             tldr = await generate_tldr(content)
             if tldr:
-                result += f"\n**TLDR:** {tldr}\n"
-        
-        result += "\n"
-    
-    return result
+                parts.append(f"\n**TLDR:** {tldr}\n")
+        parts.append("\n")
 
-
-@mcp.tool()
-async def groq_healthcheck() -> str:
-    """Check Groq connectivity and auth."""
-    if groq_client is None:
-        return "GROQ_API_KEY not configured."
-
-    try:
-        await groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": "Reply with exactly: ok"}],
-            model="llama-3.3-70b-versatile",
-            temperature=0,
-            max_tokens=5,
-        )
-        return "Groq request succeeded."
-    except Exception as e:
-        logging.exception(f"✗ Groq healthcheck failed: {type(e).__name__}: {str(e)}")
-        return f"Groq request failed: {type(e).__name__}: {str(e)}"
+    return "".join(parts)
 
 if __name__ == "__main__":
     mcp.run()
