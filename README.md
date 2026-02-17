@@ -16,7 +16,7 @@ Each tool now includes AI-powered article summarization using Groq's Llama model
 ## Installation
 
 ```bash
-pip install -e .
+uv sync
 ```
 
 ## Setup
@@ -36,7 +36,7 @@ GROQ_API_KEY=your_groq_api_key_here
 Test the server locally:
 
 ```bash
-mcp dev yipyap.py
+uv run mcp dev yipyap.py
 ```
 
 ### Using with Claude Desktop
