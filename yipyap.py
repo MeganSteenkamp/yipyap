@@ -445,7 +445,7 @@ async def summarise_weekly() -> str:
 
 
 @mcp.tool()
-async def get_drama(days: int = 7) -> str:
+async def get_drama(days: int = 1) -> str:
     """Get controversial/heated AI discussions from Reddit with AI-generated TLDRs."""
     try:
         drama_posts = await fetch_reddit_controversial(days=days, limit=5)
