@@ -1,5 +1,5 @@
 import os
-import logging
+import logfire
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Awaitable, Literal, NotRequired, TypedDict
@@ -12,7 +12,11 @@ from mcp.server.fastmcp import FastMCP
 
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+logfire.configure(
+    service_name="yipyap",
+    advanced=logfire.AdvancedOptions(base_url="https://logfire.data-platform.qa.ckotech.internal"),
+)
+logfire.instrument_httpx()
 
 mcp = FastMCP("yipyap")
 
@@ -52,7 +56,6 @@ HTTP_TIMEOUT_SECONDS = _env_float("YIPYAP_HTTP_TIMEOUT_SECONDS", 30.0)
 ARTICLE_FETCH_TIMEOUT_SECONDS = _env_float("YIPYAP_ARTICLE_FETCH_TIMEOUT_SECONDS", 15.0)
 HTTP_CA_BUNDLE = (
     os.environ.get("YIPYAP_HTTP_CA_BUNDLE")
-    or os.environ.get("REQUESTS_CA_BUNDLE")
     or os.environ.get("SSL_CERT_FILE")
     or None
 )
@@ -73,9 +76,9 @@ class Post(TypedDict):
 
 groq_api_key = os.environ.get("GROQ_API_KEY")
 if groq_api_key:
-    logging.info("✓ GROQ_API_KEY loaded")
+    logfire.info("✓ GROQ_API_KEY loaded")
 else:
-    logging.error("✗ GROQ_API_KEY not found in environment variables")
+    logfire.error("✗ GROQ_API_KEY not found in environment variables")
 
 groq_base_url = os.environ.get("GROQ_BASE_URL") or None
 groq_timeout_seconds = _env_float("GROQ_TIMEOUT_SECONDS", 30.0)
@@ -184,6 +187,7 @@ def _hn_hit_to_post(hit: dict[str, object]) -> Post:
     }
 
 
+@logfire.instrument("fetch_article_content {url}")
 async def fetch_article_content(url: str) -> str:
     try:
         async with httpx.AsyncClient(
@@ -209,16 +213,17 @@ async def fetch_article_content(url: str) -> str:
 
             words = text.split()[:1000]
             content = " ".join(words)
-            logging.info(f"✓ Fetched content from {url[:50]}... ({len(content)} chars)")
+            logfire.info("✓ Fetched content from {url}", url=url[:50], content_length=len(content))
             return content
     except Exception as e:
-        logging.error(f"✗ Failed to fetch {url[:50]}...: {type(e).__name__}: {str(e)}")
+        logfire.error("✗ Failed to fetch {url}", url=url[:50], exc_type=type(e).__name__, exc_msg=str(e))
         return ""
 
 
+@logfire.instrument("generate_tldr")
 async def generate_tldr(content: str) -> str:
     if not content or len(content) < 100:
-        logging.warning(f"✗ Content too short for TLDR ({len(content)} chars)")
+        logfire.warn("✗ Content too short for TLDR", content_length=len(content))
         return ""
     try:
         response = await groq_client.chat.completions.create(
@@ -233,10 +238,10 @@ async def generate_tldr(content: str) -> str:
             max_tokens=150,
         )
         tldr = response.choices[0].message.content.strip()
-        logging.info(f"✓ Generated TLDR: {tldr[:50]}...")
+        logfire.info("✓ Generated TLDR: {preview}", preview=tldr[:50])
         return tldr
     except Exception as e:
-        logging.exception(f"✗ Failed to generate TLDR: {type(e).__name__}: {str(e)}")
+        logfire.exception("✗ Failed to generate TLDR")
         return ""
 
 
@@ -413,141 +418,144 @@ def _render_post_block(i: int, post: Post, *, include_ratio: bool) -> str:
 @mcp.tool()
 async def summarise_weekly() -> str:
     """Get top tech news from the past week across Reddit and Hacker News with AI-generated TLDRs."""
+    with logfire.span("summarise_weekly"):
+        errors: list[str] = []
+        reddit_posts, reddit_err = await _safe_posts("Reddit", fetch_reddit_posts(days=7, limit=5))
+        hn_posts, hn_err = await _safe_posts("HN", fetch_hn_posts(days=7, limit=5))
+        for err in (reddit_err, hn_err):
+            if err:
+                errors.append(err)
 
-    errors: list[str] = []
-    reddit_posts, reddit_err = await _safe_posts("Reddit", fetch_reddit_posts(days=7, limit=5))
-    hn_posts, hn_err = await _safe_posts("HN", fetch_hn_posts(days=7, limit=5))
-    for err in (reddit_err, hn_err):
-        if err:
-            errors.append(err)
+        all_posts: list[Post] = reddit_posts + hn_posts
+        all_posts.sort(key=lambda x: x["score"], reverse=True)
 
-    all_posts: list[Post] = reddit_posts + hn_posts
-    all_posts.sort(key=lambda x: x["score"], reverse=True)
+        if not all_posts:
+            error_msg = "No posts found in the past week."
+            if errors:
+                error_msg += "\n\nErrors encountered:\n" + "\n".join(errors)
+            return error_msg
 
-    if not all_posts:
-        error_msg = "No posts found in the past week."
-        if errors:
-            error_msg += "\n\nErrors encountered:\n" + "\n".join(errors)
-        return error_msg
+        parts: list[str] = ["# Top Tech News - Past Week\n\n"]
 
-    parts: list[str] = ["# Top Tech News - Past Week\n\n"]
+        for i, post in enumerate(all_posts[:10], 1):
+            parts.append(_render_post_block(i, post, include_ratio=False))
+            content = await fetch_article_content(post["url"])
+            if content:
+                tldr = await generate_tldr(content)
+                if tldr:
+                    parts.append(f"\n**TLDR:** {tldr}\n")
+            parts.append("\n")
 
-    for i, post in enumerate(all_posts[:10], 1):
-        parts.append(_render_post_block(i, post, include_ratio=False))
-        content = await fetch_article_content(post["url"])
-        if content:
-            tldr = await generate_tldr(content)
-            if tldr:
-                parts.append(f"\n**TLDR:** {tldr}\n")
-        parts.append("\n")
-
-    return "".join(parts)
+        return "".join(parts)
 
 
 @mcp.tool()
 async def get_drama(days: int = 7) -> str:
     """Get controversial/heated AI discussions from Reddit with AI-generated TLDRs."""
-    try:
-        drama_posts = await fetch_reddit_controversial(days=days, limit=5)
-    except Exception as e:
-        return f"Error fetching controversial posts: {str(e)}"
+    with logfire.span("get_drama", days=days):
+        try:
+            drama_posts = await fetch_reddit_controversial(days=days, limit=5)
+        except Exception as e:
+            return f"Error fetching controversial posts: {str(e)}"
 
-    if not drama_posts:
-        return f"No controversial posts found in the past {days} day(s)."
+        if not drama_posts:
+            return f"No controversial posts found in the past {days} day(s)."
 
-    parts: list[str] = [f"# Controversial AI Discussions - Past {days} Day(s)\n\n"]
-    for i, post in enumerate(drama_posts, 1):
-        parts.append(_render_post_block(i, post, include_ratio=False))
-        content = await fetch_article_content(post["url"])
-        if content:
-            tldr = await generate_tldr(content)
-            if tldr:
-                parts.append(f"\n**TLDR:** {tldr}\n")
-        parts.append("\n")
+        parts: list[str] = [f"# Controversial AI Discussions - Past {days} Day(s)\n\n"]
+        for i, post in enumerate(drama_posts, 1):
+            parts.append(_render_post_block(i, post, include_ratio=False))
+            content = await fetch_article_content(post["url"])
+            if content:
+                tldr = await generate_tldr(content)
+                if tldr:
+                    parts.append(f"\n**TLDR:** {tldr}\n")
+            parts.append("\n")
 
-    return "".join(parts)
+        return "".join(parts)
 
 
 @mcp.tool()
 async def get_trending(days: int = 7) -> str:
     """Get trending AI posts with high engagement and AI-generated TLDRs."""
-    errors: list[str] = []
+    with logfire.span("get_trending", days=days):
+        errors: list[str] = []
 
-    reddit_posts, reddit_err = await _safe_posts("Reddit", fetch_reddit_posts(days=days, limit=100))
-    if reddit_err:
-        errors.append(reddit_err)
-    for post in reddit_posts:
-        post["ratio"] = post["comments"] / max(post["score"], 1)
-    reddit_posts.sort(key=lambda x: x.get("ratio", 0.0), reverse=True)
-    reddit_trending = reddit_posts[:5]
+        reddit_posts, reddit_err = await _safe_posts("Reddit", fetch_reddit_posts(days=days, limit=100))
+        if reddit_err:
+            errors.append(reddit_err)
+        for post in reddit_posts:
+            post["ratio"] = post["comments"] / max(post["score"], 1)
+        reddit_posts.sort(key=lambda x: x.get("ratio", 0.0), reverse=True)
+        reddit_trending = reddit_posts[:5]
 
-    hn_posts, hn_err = await _safe_posts("HN", fetch_hn_posts(days=days, limit=100))
-    if hn_err:
-        errors.append(hn_err)
-    for post in hn_posts:
-        post["ratio"] = post["comments"] / max(post["score"], 1)
-    hn_posts.sort(key=lambda x: x.get("ratio", 0.0), reverse=True)
-    hn_trending = hn_posts[:5]
+        hn_posts, hn_err = await _safe_posts("HN", fetch_hn_posts(days=days, limit=100))
+        if hn_err:
+            errors.append(hn_err)
+        for post in hn_posts:
+            post["ratio"] = post["comments"] / max(post["score"], 1)
+        hn_posts.sort(key=lambda x: x.get("ratio", 0.0), reverse=True)
+        hn_trending = hn_posts[:5]
 
-    all_posts: list[Post] = reddit_trending + hn_trending
-    all_posts.sort(key=lambda x: x.get("ratio", 0.0), reverse=True)
+        all_posts: list[Post] = reddit_trending + hn_trending
+        all_posts.sort(key=lambda x: x.get("ratio", 0.0), reverse=True)
 
-    if not all_posts:
-        error_msg = f"No trending posts found in the past {days} day(s)."
-        if errors:
-            error_msg += "\n\nErrors encountered:\n" + "\n".join(errors)
-        return error_msg
+        if not all_posts:
+            error_msg = f"No trending posts found in the past {days} day(s)."
+            if errors:
+                error_msg += "\n\nErrors encountered:\n" + "\n".join(errors)
+            return error_msg
 
-    parts: list[str] = [
-        f"# Trending AI Discussions - Past {days} Day(s)\n\n",
-        "*Posts with high engagement (lots of discussion relative to upvotes)*\n\n",
-    ]
+        parts: list[str] = [
+            f"# Trending AI Discussions - Past {days} Day(s)\n\n",
+            "*Posts with high engagement (lots of discussion relative to upvotes)*\n\n",
+        ]
 
-    for i, post in enumerate(all_posts[:10], 1):
-        parts.append(_render_post_block(i, post, include_ratio=True))
-        content = await fetch_article_content(post["url"])
-        if content:
-            tldr = await generate_tldr(content)
-            if tldr:
-                parts.append(f"\n**TLDR:** {tldr}\n")
-        parts.append("\n")
+        for i, post in enumerate(all_posts[:10], 1):
+            parts.append(_render_post_block(i, post, include_ratio=True))
+            content = await fetch_article_content(post["url"])
+            if content:
+                tldr = await generate_tldr(content)
+                if tldr:
+                    parts.append(f"\n**TLDR:** {tldr}\n")
+            parts.append("\n")
 
-    return "".join(parts)
+        return "".join(parts)
 
 
 @mcp.tool()
 async def get_news(keyword: str, days: int = 7) -> str:
     """Search for news about a keyword with AI-generated TLDRs."""
-    errors: list[str] = []
+    with logfire.span("get_news", keyword=keyword, days=days):
+        errors: list[str] = []
 
-    reddit_posts, reddit_err = await _safe_posts(
-        "Reddit", search_reddit_posts(keyword=keyword, days=days, limit=5)
-    )
-    hn_posts, hn_err = await _safe_posts("HN", search_hn_posts(keyword=keyword, days=days, limit=5))
-    for err in (reddit_err, hn_err):
-        if err:
-            errors.append(err)
+        reddit_posts, reddit_err = await _safe_posts(
+            "Reddit", search_reddit_posts(keyword=keyword, days=days, limit=5)
+        )
+        hn_posts, hn_err = await _safe_posts("HN", search_hn_posts(keyword=keyword, days=days, limit=5))
+        for err in (reddit_err, hn_err):
+            if err:
+                errors.append(err)
 
-    all_posts: list[Post] = reddit_posts + hn_posts
-    all_posts.sort(key=lambda x: x["score"], reverse=True)
+        all_posts: list[Post] = reddit_posts + hn_posts
+        all_posts.sort(key=lambda x: x["score"], reverse=True)
 
-    if not all_posts:
-        error_msg = f"No posts found for '{keyword}' in the past {days} day(s)."
-        if errors:
-            error_msg += "\n\nErrors encountered:\n" + "\n".join(errors)
-        return error_msg
+        if not all_posts:
+            error_msg = f"No posts found for '{keyword}' in the past {days} day(s)."
+            if errors:
+                error_msg += "\n\nErrors encountered:\n" + "\n".join(errors)
+            return error_msg
 
-    parts: list[str] = [f"# News about '{keyword}' - Past {days} Day(s)\n\n"]
-    for i, post in enumerate(all_posts[:10], 1):
-        parts.append(_render_post_block(i, post, include_ratio=False))
-        content = await fetch_article_content(post["url"])
-        if content:
-            tldr = await generate_tldr(content)
-            if tldr:
-                parts.append(f"\n**TLDR:** {tldr}\n")
-        parts.append("\n")
+        parts: list[str] = [f"# News about '{keyword}' - Past {days} Day(s)\n\n"]
+        for i, post in enumerate(all_posts[:10], 1):
+            parts.append(_render_post_block(i, post, include_ratio=False))
+            content = await fetch_article_content(post["url"])
+            if content:
+                tldr = await generate_tldr(content)
+                if tldr:
+                    parts.append(f"\n**TLDR:** {tldr}\n")
+            parts.append("\n")
 
-    return "".join(parts)
+        return "".join(parts)
 
 if __name__ == "__main__":
     mcp.run()
