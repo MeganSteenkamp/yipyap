@@ -15,6 +15,8 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "python-dotenv>=1.0.0",
     "logfire>=4.24.0",
+    "pydantic-evals>=1.61.0",
+    "pydantic-ai[groq]>=1.61.0",
 ]
 
 [tool.setuptools]
